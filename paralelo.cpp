@@ -135,40 +135,60 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
     for (int iter = 0; iter < max_iters; ++iter) {
         bool hubo_cambios = false;
 
-        // ASIGNACIÓN DE PUNTOS A CENTROIDES (PARALELO)
-        #pragma omp parallel for schedule(static) reduction(|:hubo_cambios)
-        for (size_t i = 0; i < num_puntos; ++i) {
-            double min_dist = numeric_limits<double>::max();
-            int mejor_cluster = -1;
-
-            for (int j = 0; j < K; ++j) {
-                double dist = distancia_sq(puntos[i], centroides[j]);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    mejor_cluster = j;
-                }
-            }
-
-            if (asignaciones[i] != mejor_cluster) {
-                asignaciones[i] = mejor_cluster;
-                hubo_cambios = true;
-            }
-        }
-
-        // RECALCULAR CENTROIDES (SECUENCIAL)
+        // Sumas y conteos globales para esta iteración
         vector<Point> nuevas_sumas(K, Point(dim, 0.0));
         vector<int> conteos(K, 0);
 
-        for (size_t i = 0; i < num_puntos; ++i) {
-            int id = asignaciones[i];
-            if (id >= 0 && id < K) {
-                conteos[id]++;
-                for (int d = 0; d < dim; ++d) {
-                    nuevas_sumas[id][d] += puntos[i][d];
+        // --- Región paralela: asignación + acumulación de sumas/conteos ---
+        #pragma omp parallel
+        {
+            // Buffers locales por hilo para evitar condiciones de carrera
+            vector<Point> local_sumas(K, Point(dim, 0.0));
+            vector<int> local_conteos(K, 0);
+
+            #pragma omp for schedule(static) reduction(|:hubo_cambios)
+            for (size_t i = 0; i < num_puntos; ++i) {
+                double min_dist = numeric_limits<double>::max();
+                int mejor_cluster = -1;
+
+                // Buscar cluster más cercano
+                for (int j = 0; j < K; ++j) {
+                    double dist = distancia_sq(puntos[i], centroides[j]);
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        mejor_cluster = j;
+                    }
+                }
+
+                // Comprobar cambio de asignación
+                if (asignaciones[i] != mejor_cluster) {
+                    hubo_cambios = true;
+                    asignaciones[i] = mejor_cluster;
+                }
+
+                // Acumular en los buffers locales del hilo
+                if (mejor_cluster >= 0) {
+                    local_conteos[mejor_cluster]++;
+                    for (int d = 0; d < dim; ++d) {
+                        local_sumas[mejor_cluster][d] += puntos[i][d];
+                    }
                 }
             }
-        }
 
+            // Reducimos los buffers locales a los globales
+            #pragma omp critical
+            {
+                for (int j = 0; j < K; ++j) {
+                    conteos[j] += local_conteos[j];
+                    for (int d = 0; d < dim; ++d) {
+                        nuevas_sumas[j][d] += local_sumas[j][d];
+                    }
+                }
+            }
+        } // fin región paralela
+
+        // --- Recalcular centroides (también en paralelo) ---
+        #pragma omp parallel for
         for (int j = 0; j < K; ++j) {
             if (conteos[j] > 0) {
                 for (int d = 0; d < dim; ++d) {
@@ -177,7 +197,7 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
             }
         }
 
-        // Guardamos la cardinalidad de esta iteración
+        // Guardar cardinalidades de esta iteración
         conteos_final = conteos;
         iter_real = iter + 1;
 
@@ -193,7 +213,7 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
     // Rellenar cabecera de respuesta
     ResponseHeader header;
     header.cpu_time   = tiempo_total;
-    header.iterations = iter_real; // iteraciones realmente usadas
+    header.iterations = iter_real;
     header.k          = K;
     header.dim        = dim;
 
@@ -221,6 +241,7 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
         cout << "  Cluster " << j << ": " << conteos_final[j] << " puntos" << endl;
     }
 }
+
 
 // ---------------------------------------------------------
 // FUNCIÓN PRINCIPAL (MAIN)
