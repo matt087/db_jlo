@@ -117,7 +117,7 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
 
     size_t num_puntos = puntos.size();
 
-    // Inicialización simple: primeros K puntos como centroides
+    // Inicialización simple: primeros K puntos como centroides (igual que secuencial)
     vector<Point> centroides(K);
     for (int i = 0; i < K; ++i) {
         centroides[i] = puntos[i];
@@ -126,121 +126,75 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
     // Asignación de cada punto a un cluster
     vector<int> asignaciones(num_puntos, -1);
 
-    // Acumuladores globales (se rellenan en cada iteración)
-    vector<Point> nuevas_sumas(K, Point(dim, 0.0));
-    vector<int>  conteos(K, 0);
-
-    // Para guardar las cardinalidades finales
+    // Para guardar la cardinalidad final de cada cluster
     vector<int> conteos_final(K, 0);
 
-    double start_time = omp_get_wtime();
-    int    iter_real  = 0;
+    double start_time = omp_get_wtime();  // solo mide el clustering
+    int iter_real = 0;
 
-    bool hubo_cambios_global = true;  // para la condición de parada
-    bool stop = false;                // indica que ya no hay cambios
+    for (int iter = 0; iter < max_iters; ++iter) {
+        bool hubo_cambios = false;
 
-    #pragma omp parallel shared(hubo_cambios_global, stop, iter_real, \
-                                centroides, asignaciones, nuevas_sumas, \
-                                conteos, puntos)
-    {
-        // Buffers locales por hilo
-        vector<Point> local_sumas(K, Point(dim, 0.0));
-        vector<int>   local_conteos(K, 0);
+        // ==== ASIGNACIÓN EN PARALELO ====
+        // Misma lógica que en la versión secuencial, pero con parallel for
+        #pragma omp parallel for schedule(static) reduction(||:hubo_cambios)
+        for (size_t i = 0; i < num_puntos; ++i) {
+            double min_dist = numeric_limits<double>::max();
+            int mejor_cluster = -1;
 
-        for (int iter = 0; iter < max_iters; ++iter) {
-
-            // Si ya se decidió parar en una iteración anterior, todos salen
-            #pragma omp barrier
-            if (stop) break;
-
-            // Solo un hilo resetea los acumuladores globales y la bandera
-            #pragma omp single
-            {
-                hubo_cambios_global = false;
-                // limpiar acumuladores globales
-                for (int j = 0; j < K; ++j) {
-                    conteos[j] = 0;
-                    std::fill(nuevas_sumas[j].begin(), nuevas_sumas[j].end(), 0.0);
-                }
-                iter_real = iter + 1;
-            }
-
-            // Todos los hilos limpian sus acumuladores locales
             for (int j = 0; j < K; ++j) {
-                local_conteos[j] = 0;
-                std::fill(local_sumas[j].begin(), local_sumas[j].end(), 0.0);
-            }
-
-            #pragma omp for schedule(static) reduction(|:hubo_cambios_global)
-            for (size_t i = 0; i < num_puntos; ++i) {
-                double min_dist = numeric_limits<double>::max();
-                int mejor_cluster = -1;
-
-                for (int j = 0; j < K; ++j) {
-                    double dist = distancia_sq(puntos[i], centroides[j]);
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        mejor_cluster = j;
-                    }
-                }
-
-                if (asignaciones[i] != mejor_cluster) {
-                    asignaciones[i] = mejor_cluster;
-                    hubo_cambios_global = true;
-                }
-
-                if (mejor_cluster >= 0) {
-                    local_conteos[mejor_cluster]++;
-                    for (int d = 0; d < dim; ++d) {
-                        local_sumas[mejor_cluster][d] += puntos[i][d];
-                    }
+                double dist = distancia_sq(puntos[i], centroides[j]);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    mejor_cluster = j;
                 }
             }
 
-            #pragma omp critical
-            {
-                for (int j = 0; j < K; ++j) {
-                    conteos[j] += local_conteos[j];
-                    for (int d = 0; d < dim; ++d) {
-                        nuevas_sumas[j][d] += local_sumas[j][d];
-                    }
+            if (asignaciones[i] != mejor_cluster) {
+                asignaciones[i] = mejor_cluster;
+                hubo_cambios = true;  // la reducción OR se encarga del resto
+            }
+        }
+
+        // ==== RECÁLCULO DE CENTROIDES (SECUENCIAL, IGUAL QUE EN SECUENCIAL) ====
+        vector<Point> nuevas_sumas(K, Point(dim, 0.0));
+        vector<int> conteos(K, 0);
+
+        for (size_t i = 0; i < num_puntos; ++i) {
+            int id = asignaciones[i];
+            if (id >= 0 && id < K) {
+                conteos[id]++;
+                for (int d = 0; d < dim; ++d) {
+                    nuevas_sumas[id][d] += puntos[i][d];
                 }
             }
+        }
 
-            #pragma omp for
-            for (int j = 0; j < K; ++j) {
-                if (conteos[j] > 0) {
-                    for (int d = 0; d < dim; ++d) {
-                        centroides[j][d] = nuevas_sumas[j][d] / conteos[j];
-                    }
+        for (int j = 0; j < K; ++j) {
+            if (conteos[j] > 0) {
+                for (int d = 0; d < dim; ++d) {
+                    centroides[j][d] = nuevas_sumas[j][d] / conteos[j];
                 }
             }
+        }
 
-            // Todos los hilos esperan a que se termine la iteración
-            #pragma omp barrier
+        // Guardamos la cardinalidad de esta iteración
+        conteos_final = conteos;
+        iter_real = iter + 1;
 
-            // Un solo hilo decide si se detiene por convergencia
-            #pragma omp single
-            {
-                if (!hubo_cambios_global) {
-                    cout << "[Proceso] Convergencia alcanzada en iteración "
-                         << (iter_real - 1) << endl;
-                    stop = true;
-                }
-            }
-        } // fin bucle de iteraciones
-    } // fin región paralela
+        if (!hubo_cambios) {
+            cout << "[Proceso] Convergencia alcanzada en iteración " << iter << endl;
+            break;
+        }
+    }
 
     double end_time = omp_get_wtime();
     double tiempo_total = end_time - start_time;
 
-    // Guardamos la cardinalidad final de los clusters
-    conteos_final = conteos;
-
     // Rellenar cabecera de respuesta
     ResponseHeader header;
-    header.cpu_time   = tiempo_total;  // solo clustering
-    header.iterations = iter_real;     // iteraciones realmente usadas
+    header.cpu_time   = tiempo_total;
+    header.iterations = iter_real; // iteraciones realmente usadas
     header.k          = K;
     header.dim        = dim;
 
@@ -261,13 +215,14 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
     }
 
     // Logs en servidor
-    cout << "MODO: PARALELO - Tiempo: " << tiempo_total << " segundos" << endl;
+    cout << "MODO: PARALELO SIMPLE - Tiempo: " << tiempo_total << " segundos" << endl;
     cout << "Threads activos: " << omp_get_max_threads() << endl;
     cout << "Cardinalidad de los clusters:" << endl;
     for (int j = 0; j < K; ++j) {
         cout << "  Cluster " << j << ": " << conteos_final[j] << " puntos" << endl;
     }
 }
+
 
 // ---------------------------------------------------------
 // FUNCIÓN PRINCIPAL (MAIN)
