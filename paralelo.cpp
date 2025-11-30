@@ -186,6 +186,7 @@ void ejecutar_kmeans_paralelo(int K, int max_iters, int socket_cliente) {
 
                 if (asignaciones[i] != mejor_cluster) {
                     asignaciones[i] = mejor_cluster;
+                    hubo_cambios_global = true;
                 }
 
                 if (mejor_cluster >= 0) {
